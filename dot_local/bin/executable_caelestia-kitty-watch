@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+WALLPAPER_STATE="$HOME/.local/state/caelestia/wallpaper/path.txt"
+
+while inotifywait -q -e close_write,move,create "$WALLPAPER_STATE"; do
+    ~/.local/bin/caelestia-kitty-colors
+done

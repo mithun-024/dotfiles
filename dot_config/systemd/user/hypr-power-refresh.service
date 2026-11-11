@@ -1,0 +1,12 @@
+[Unit]
+Description=Dynamic Hyprland Refresh Rate Switcher (AC / Battery)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hypr-power-refresh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

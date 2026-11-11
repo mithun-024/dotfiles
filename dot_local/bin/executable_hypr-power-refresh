@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+import os
+import sys
+import glob
+import json
+import time
+import subprocess
+import signal
+
+# Optional DBus & GLib imports
+try:
+    import dbus
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+    HAS_DBUS = True
+except ImportError:
+    HAS_DBUS = False
+
+LAST_CHARGING_STATE = None
+
+def get_hypr_env():
+    """Ensure HYPRLAND_INSTANCE_SIGNATURE and XDG_RUNTIME_DIR are correctly set."""
+    env = dict(os.environ)
+    uid = os.getuid()
+    runtime_dir = env.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if sig and os.path.exists(f"{runtime_dir}/hypr/{sig}/.socket.sock"):
+        return env
+
+    # Discover the latest active hyprland socket
+    hypr_dir = os.path.join(runtime_dir, "hypr")
+    if os.path.isdir(hypr_dir):
+        candidates = []
+        for d in os.listdir(hypr_dir):
+            sock = os.path.join(hypr_dir, d, ".socket.sock")
+            if os.path.exists(sock):
+                try:
+                    candidates.append((os.path.getmtime(sock), d))
+                except OSError:
+                    pass
+        if candidates:
+            candidates.sort(reverse=True)
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = candidates[0][1]
+            return env
+
+    return env
+
+def is_charging():
+    """Detect whether the laptop is connected to AC power / charging."""
+    # 1. Check AC / Mains power supplies in sysfs
+    found_mains = False
+    for p in glob.glob("/sys/class/power_supply/*"):
+        type_file = os.path.join(p, "type")
+        online_file = os.path.join(p, "online")
+        if os.path.isfile(type_file) and os.path.isfile(online_file):
+            try:
+                with open(type_file, "r") as f:
+                    t = f.read().strip()
+                if t in ("Mains", "USB"):
+                    found_mains = True
+                    with open(online_file, "r") as f:
+                        if f.read().strip() == "1":
+                            return True
+            except Exception:
+                pass
+
+    # 2. Check Battery status in sysfs
+    for p in glob.glob("/sys/class/power_supply/BAT*"):
+        status_file = os.path.join(p, "status")
+        if os.path.isfile(status_file):
+            try:
+                with open(status_file, "r") as f:
+                    st = f.read().strip().lower()
+                    if st in ("charging", "full"):
+                        return True
+            except Exception:
+                pass
+
+    if found_mains:
+        return False
+
+    # 3. UPower DBus fallback
+    if HAS_DBUS:
+        try:
+            bus = dbus.SystemBus()
+            up = bus.get_object("org.freedesktop.UPower", "/org/freedesktop/UPower")
+            props = dbus.Interface(up, "org.freedesktop.DBus.Properties")
+            on_battery = bool(props.Get("org.freedesktop.UPower", "OnBattery"))
+            return not on_battery
+        except Exception:
+            pass
+
+    return False
+
+def apply_refresh_rate(force=False):
+    """Check power state and update laptop display refresh rate if needed."""
+    global LAST_CHARGING_STATE
+
+    charging = is_charging()
+    if not force and LAST_CHARGING_STATE == charging:
+        return False
+
+    target_hz = 165 if charging else 60
+    env = get_hypr_env()
+
+    try:
+        proc = subprocess.run(
+            ["hyprctl", "-j", "monitors"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=3
+        )
+        if proc.returncode != 0:
+            return False
+        monitors = json.loads(proc.stdout)
+    except Exception:
+        return False
+
+    changed = False
+    for mon in monitors:
+        name = mon.get("name", "")
+        # Internal laptop screens usually start with eDP (e.g. eDP-1)
+        is_laptop_display = name.startswith("eDP") or (len(monitors) == 1 and not name.startswith("HEADLESS"))
+        if not is_laptop_display:
+            continue
+
+        current_hz = mon.get("refreshRate", 0.0)
+        if abs(current_hz - target_hz) < 1.0:
+            continue
+
+        w = mon.get("width")
+        h = mon.get("height")
+        x = mon.get("x", 0)
+        y = mon.get("y", 0)
+        scale = mon.get("scale", 1)
+
+        lua_cmd = f'hl.monitor({{ output = "{name}", mode = "{w}x{h}@{target_hz}", position = "{x}x{y}", scale = {scale} }})'
+        res = subprocess.run(
+            ["hyprctl", "eval", lua_cmd],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=3
+        )
+        if res.returncode == 0 and "ok" in res.stdout:
+            changed = True
+            print(f"[hypr-power-refresh] Switched {name} to {target_hz}Hz (charging={charging})")
+
+    if changed:
+        msg = f"Charging: Refresh rate set to {target_hz}Hz" if charging else f"On Battery: Refresh rate set to {target_hz}Hz"
+        try:
+            subprocess.run(
+                ["notify-send", "-u", "low", "-t", "2000", "-i", "preferences-desktop-display", "Display Refresh Rate", msg],
+                env=env,
+                timeout=2
+            )
+        except Exception:
+            pass
+
+    LAST_CHARGING_STATE = charging
+    return changed
+
+def run_daemon():
+    """Run continuously, listening to DBus power events and polling as a safety fallback."""
+    print("[hypr-power-refresh] Starting power monitor daemon...")
+    apply_refresh_rate(force=True)
+
+    def signal_handler(signum, frame):
+        print("[hypr-power-refresh] Exiting...")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    if HAS_DBUS:
+        try:
+            DBusGMainLoop(set_as_default=True)
+            bus = dbus.SystemBus()
+
+            def on_upower_prop_changed(*args, **kwargs):
+                apply_refresh_rate()
+
+            bus.add_signal_receiver(
+                on_upower_prop_changed,
+                signal_name="PropertiesChanged",
+                dbus_interface="org.freedesktop.DBus.Properties",
+                bus_name="org.freedesktop.UPower"
+            )
+
+            # Safety fallback heartbeat: check every 3 seconds
+            GLib.timeout_add_seconds(3, lambda: (apply_refresh_rate(), True)[1])
+
+            loop = GLib.MainLoop()
+            loop.run()
+            return
+        except Exception as e:
+            print(f"[hypr-power-refresh] DBus initialization failed: {e}. Falling back to polling.")
+
+    # Polling fallback if DBus is unavailable
+    while True:
+        try:
+            apply_refresh_rate()
+        except Exception as e:
+            print(f"[hypr-power-refresh] Error during poll: {e}")
+        time.sleep(3)
+
+def show_status():
+    charging = is_charging()
+    env = get_hypr_env()
+    print(f"Power status: {'Charging / AC' if charging else 'Battery / Discharging'}")
+    print(f"Target refresh rate: {165 if charging else 60}Hz")
+    try:
+        proc = subprocess.run(["hyprctl", "-j", "monitors"], env=env, capture_output=True, text=True, timeout=3)
+        monitors = json.loads(proc.stdout)
+        for mon in monitors:
+            print(f"Monitor {mon.get('name')}: {mon.get('width')}x{mon.get('height')}@{mon.get('refreshRate'):.2f}Hz (Scale: {mon.get('scale')})")
+    except Exception as e:
+        print(f"Could not query monitors: {e}")
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg in ("--status", "-s"):
+            show_status()
+            sys.exit(0)
+        elif arg in ("--apply", "-a"):
+            apply_refresh_rate(force=True)
+            sys.exit(0)
+        elif arg in ("--help", "-h"):
+            print("Usage: hypr-power-refresh [--daemon | --apply | --status | --help]")
+            sys.exit(0)
+
+    run_daemon()

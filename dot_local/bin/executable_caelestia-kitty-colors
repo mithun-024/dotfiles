@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+json="$(caelestia wallpaper -p)"
+
+python3 - "$json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+data = json.loads(sys.argv[1])
+c = data["colours"]
+
+lines = [
+    f"foreground #{c['text']}",
+    f"background #{c['background']}",
+]
+
+for i in range(16):
+    lines.append(f"color{i} #{c[f'term{i}']}")
+
+Path.home().joinpath(".config/kitty/caelestia.conf").write_text(
+    "\n".join(lines) + "\n"
+)
+PY
+
+kitty @ set-colors --all ~/.config/kitty/caelestia.conf

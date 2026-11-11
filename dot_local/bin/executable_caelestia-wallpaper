@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+caelestia wallpaper -f "$1"
+~/.local/bin/caelestia-kitty-colors
